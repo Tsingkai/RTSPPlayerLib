@@ -12,6 +12,7 @@ add_library(RtspPlayerDll SHARED
     registry.cpp
     frame_queue.cpp
     latency_control.cpp
+    logger.cpp
     media_source.cpp
     decoder.cpp
     player.cpp

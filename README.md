@@ -1,17 +1,18 @@
 # RTSPPlayerLib
 
-RTSPPlayerLib 是一个面向 Windows 的 C++20 动态库，通过 C ABI 为 C# 等调用方提供多实例 RTSP/RTMP 视频播放接口。它使用 FFmpeg 拉流、解码并转换为 BGR24，再通过 GDI 绘制到指定的 `HWND`。当前实现仅处理视频，不包含音频播放。
+RTSPPlayerLib 是一个面向 Windows 的 C++20 动态库，通过 C ABI 为 C# 等调用方提供多实例 RTSP/RTMP 视频播放接口。它使用 FFmpeg 拉流、解码并转换为 BGR24，再通过 GDI 绘制到指定的 `HWND`。支持硬件解码（D3D11VA/NVDEC/QSV，不可用时自动回退软件解码）与分级日志（调试器/文件/回调输出，并重定向 FFmpeg 内部日志）。当前实现仅处理视频，不包含音频播放。
 
 ## 项目结构
 
 | 文件 | 职责 |
 | --- | --- |
-| `rtsp_player_api.h` | DLL 导出的 C API、播放器句柄和配置结构 |
+| `rtsp_player_api.h` | DLL 导出的 C API、播放器句柄、配置结构及日志配置接口 |
 | `capi.cpp` | 参数校验、API 到播放器实例的分发及错误码文本 |
 | `registry.h/.cpp` | 线程安全的播放器注册表；检查句柄和流地址冲突 |
 | `player.h/.cpp` | 播放器生命周期、拉流/解码线程、渲染线程及统计信息 |
 | `media_source.h/.cpp` | FFmpeg 网络初始化、打开媒体源和读取数据包 |
-| `decoder.h/.cpp` | 视频解码、动态像素格式转换以及 BGR24 帧生成 |
+| `decoder.h/.cpp` | 视频解码（硬件加速/软件回退）、动态像素格式转换以及 BGR24 帧生成 |
+| `logger.h/.cpp` | 线程安全分级日志：调试器、可选文件、可选回调输出及 FFmpeg 日志重定向 |
 | `frame_queue.h/.cpp` | 解码帧与渲染之间的有界生产者—消费者队列 |
 | `latency_control.h/.cpp` | 无全局状态的纯函数队列丢帧策略 |
 | `renderer.h/.cpp` | 使用 GDI 将 BGR24 帧绘制到窗口 |
@@ -26,6 +27,31 @@ RTSPPlayerLib 是一个面向 Windows 的 C++20 动态库，通过 C ABI 为 C# 
 4. 调用方可通过 `pause`、`resume`、`reconnect` 和 `get_stats` 控制或查询实例；`destroy` 注销实例并在其最后一个并发引用释放时停止线程、释放资源。
 
 网络读取和解码在同一个生产线程执行，以避免额外的压缩包队列和线程切换；渲染使用独立线程，避免 GDI 阻塞拉流/解码。
+
+## 硬件解码
+
+在 `RtspPlayerConfig` 中将 `enable_hw_accel` 置为非 0 即可启用硬件解码。启用后的选择顺序为 **D3D11VA → CUDA(NVDEC) → QSV → DXVA2**：
+
+1. 依次尝试创建硬件设备上下文（`av_hwdevice_ctx_create`），创建成功且解码器支持该硬件类型时，通过 `get_format` 回调锁定硬件帧像素格式。
+2. 硬件解码输出的帧（如 NV12）会通过 `av_hwframe_transfer_data` 自动下载到系统内存，再转换为 BGR24 送入帧队列，渲染路径与软件解码完全一致。
+3. 任一环节失败（无独显、显卡驱动不支持、FFmpeg 构建未启用对应 hwaccel 等）都会记录 WARN 日志并自动回退软件解码，`rtsp_player_create` 不会因此失败。
+
+注意：硬件加速类型能否生效取决于所部署的 FFmpeg 构建和显卡驱动；运行时可从日志中的 `启用硬件解码 type=...` 或 `回退软件解码` 确认实际生效的解码方式。
+
+## 日志
+
+日志模块线程安全，每条日志带本地时间戳（毫秒）、级别和线程 ID，文本为 UTF-8。默认级别 `RTSP_LOG_INFO`，默认输出到系统调试器（Visual Studio 输出窗口 / DbgView）；可选输出到文件和外部回调：
+
+```c
+// 最低输出级别：RTSP_LOG_DEBUG / RTSP_LOG_INFO / RTSP_LOG_WARN / RTSP_LOG_ERROR
+rtsp_log_set_level(RTSP_LOG_DEBUG);
+// 追加写入日志文件（UTF-8）；传 nullptr 关闭文件输出
+rtsp_log_set_file("player.log");
+// 外部回调；传 nullptr 关闭。回调在产生日志的线程同步调用，应尽快返回
+rtsp_log_set_callback(OnLog);
+```
+
+FFmpeg 内部日志（网络错误、解码器信息等）会被重定向到同一通道，并加 `[ffmpeg]` 前缀；其中 FFmpeg 的 error/fatal 映射为 `ERROR`，warning 映射为 `WARN`，info 映射为 `INFO`，debug/trace 映射为 `DEBUG`。网络断开、重连、解码失败、队列满跳帧、渲染失败等关键事件均会记录日志，方便排查黑屏、花屏、延迟增长等问题。
 
 ## 构建
 
@@ -53,10 +79,15 @@ struct RtspPlayerConfig
     public int reconnect_interval;
     [MarshalAs(UnmanagedType.I1)]
     public bool enable_drop_old_frame;
+    [MarshalAs(UnmanagedType.I1)]
+    public bool enable_hw_accel;
 }
 
 static class RtspPlayer
 {
+    public delegate void RtspLogCallback(int level,
+        [MarshalAs(UnmanagedType.LPStr)] string message);
+
     [DllImport("RtspPlayerDll.dll", CallingConvention = CallingConvention.Cdecl)]
     public static extern int rtsp_player_create(
         ulong handle, IntPtr hwnd,
@@ -78,17 +109,33 @@ static class RtspPlayer
 
     [DllImport("RtspPlayerDll.dll", CallingConvention = CallingConvention.Cdecl)]
     public static extern int rtsp_player_destroy(ulong handle);
+
+    [DllImport("RtspPlayerDll.dll", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void rtsp_log_set_level(int level);
+
+    [DllImport("RtspPlayerDll.dll", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void rtsp_log_set_file(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
+
+    [DllImport("RtspPlayerDll.dll", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void rtsp_log_set_callback(RtspLogCallback cb);
 }
 ```
 
-最小调用顺序如下；在窗口销毁前释放播放器：
+最小调用顺序如下；在窗口销毁前释放播放器。委托实例需保存为字段防止 GC 回收：
 
 ```csharp
+// 可选：接收库内日志（含 [ffmpeg] 前缀的 FFmpeg 内部日志）
+static RtspPlayer.RtspLogCallback s_logSink = (level, msg) => Console.WriteLine($"[{level}] {msg}");
+RtspPlayer.rtsp_log_set_callback(s_logSink);
+RtspPlayer.rtsp_log_set_file("player.log");
+
 var config = new RtspPlayerConfig
 {
     max_queue_ms = 300,
     reconnect_interval = 2000,
-    enable_drop_old_frame = true
+    enable_drop_old_frame = true,
+    enable_hw_accel = true
 };
 
 ulong handle = 1; // 每个活动播放器使用唯一句柄
@@ -110,5 +157,7 @@ C API 返回 `RtspErrorCode`，成功为 `RTSP_OK`（0）；错误码定义在 `
 - `max_queue_ms` 必须大于 0；`reconnect_interval` 不能小于 0，单位均为毫秒。帧时长根据视频帧率估算，未知帧率时按约 33 ms 估算。
 - `enable_drop_old_frame = true` 时队列超限会移除较旧帧来降低延迟；为 `false` 时会跳过新帧，不主动丢弃已排队帧。队列至少允许容纳一帧，因此单帧时长大于上限时队列可能短暂超过配置值。
 - `rtsp_player_create` 会同步打开网络流，耗时取决于连接和服务器响应。网络读取配置了约 10 秒超时，因此暂停或销毁遇到阻塞读取时可能需要等待读取超时。
-- 创建成功后的异步网络、解码或渲染错误目前没有事件/回调接口；网络读取失败会按配置间隔自动重连。统计接口不提供连接状态。
-- 当前输出为 CPU 解码后的 BGR24，并通过 GDI 绘制；尚未实现硬件解码、音频播放、窗口尺寸自适应或用户可配置的像素格式。
+- `enable_hw_accel = true` 时不保证一定使用硬件解码：所选 FFmpeg 构建需包含对应 hwaccel（D3D11VA 为 Windows 通用构建默认包含），且显卡驱动需支持；失败时自动回退软件解码并记录 WARN 日志。硬件解码输出仍为下载到内存后的 BGR24（GPU→CPU 拷贝），高分辨率高帧率下可观察 `get_stats` 的 FPS 评估收益。
+- 日志回调在产生日志的库线程上同步执行，回调内部不应再调用本库 API，避免重入死锁；文件日志为追加模式，长期运行请自行按日期切换文件（重新调用 `rtsp_log_set_file`）。
+- 创建成功后的异步网络、解码或渲染错误目前没有事件/回调接口；网络读取失败会按配置间隔自动重连，失败细节可通过日志（含 `[ffmpeg]` 前缀）观察。统计接口不提供连接状态。
+- 当前输出为解码后的 BGR24，并通过 GDI 绘制；尚未实现音频播放、窗口尺寸自适应或用户可配置的像素格式。

@@ -1,4 +1,5 @@
 #include "rtsp_player_api.h"
+#include "logger.h"
 #include "registry.h"
 #include "player.h"
 #include <new>
@@ -8,7 +9,11 @@ RTSP_API RtspErrorCode rtsp_player_create(RtspPlayerHandle handle, HWND hwnd, co
 {
     if (!url || url[0] == '\0' || !cfg || !hwnd ||
         cfg->max_queue_ms <= 0 || cfg->reconnect_interval < 0)
+    {
+        rtsp_log_write(RTSP_LOG_ERROR, "api: create 参数非法 handle=%llu",
+            static_cast<unsigned long long>(handle));
         return RTSP_ERR_INVALID_ARG;
+    }
 
     std::shared_ptr<Player> player;
     try
@@ -17,25 +22,41 @@ RTSP_API RtspErrorCode rtsp_player_create(RtspPlayerHandle handle, HWND hwnd, co
     }
     catch (const std::bad_alloc&)
     {
+        rtsp_log_write(RTSP_LOG_ERROR, "api: create 内存分配失败 handle=%llu",
+            static_cast<unsigned long long>(handle));
         return RTSP_ERR_ALLOC_FAILED;
     }
 
     const auto startResult = player->Start();
     if (startResult != RTSP_OK)
+    {
+        rtsp_log_write(RTSP_LOG_ERROR, "api: create 启动播放器失败 handle=%llu url=%s code=%d",
+            static_cast<unsigned long long>(handle), url, startResult);
         return startResult;
+    }
 
     try
     {
-        return PlayerRegistry::Instance().Register(handle, hwnd, url, std::move(player));
+        const auto registerResult = PlayerRegistry::Instance().Register(handle, hwnd, url, std::move(player));
+        if (registerResult != RTSP_OK)
+        {
+            rtsp_log_write(RTSP_LOG_ERROR, "api: create 注册失败 handle=%llu url=%s code=%d",
+                static_cast<unsigned long long>(handle), url, registerResult);
+        }
+        return registerResult;
     }
     catch (const std::bad_alloc&)
     {
+        rtsp_log_write(RTSP_LOG_ERROR, "api: create 注册内存分配失败 handle=%llu",
+            static_cast<unsigned long long>(handle));
         return RTSP_ERR_ALLOC_FAILED;
     }
 }
 
 RTSP_API RtspErrorCode rtsp_player_destroy(RtspPlayerHandle handle)
 {
+    rtsp_log_write(RTSP_LOG_DEBUG, "api: destroy handle=%llu",
+        static_cast<unsigned long long>(handle));
     auto player = PlayerRegistry::Instance().GetPlayer(handle);
     if (!player) return RTSP_ERR_NOT_FOUND;
     return PlayerRegistry::Instance().Unregister(handle);

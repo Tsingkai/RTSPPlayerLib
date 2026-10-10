@@ -29,7 +29,26 @@ typedef struct
     int32_t max_queue_ms;       // 最大缓冲队列时长(ms)，用于控制延迟
     int32_t reconnect_interval; // 网络断开重连间隔(ms)
     bool enable_drop_old_frame; // 队列满时丢弃旧帧追赶实时流
+    bool enable_hw_accel;       // 启用硬件解码(D3D11VA/NVDEC/QSV)，不可用时自动回退软件解码
 } RtspPlayerConfig;
+
+/**
+ * @brief 日志级别
+ */
+typedef enum
+{
+    RTSP_LOG_DEBUG = 0, // 调试信息
+    RTSP_LOG_INFO = 1,  // 一般信息
+    RTSP_LOG_WARN = 2,  // 警告
+    RTSP_LOG_ERROR = 3  // 错误
+} RtspLogLevel;
+
+/**
+ * @brief 外部日志回调函数类型
+ * @param level 日志级别
+ * @param message UTF-8 编码的日志文本（不含换行）
+ */
+typedef void (*RtspLogCallback)(RtspLogLevel level, const char* message);
 
 /**
  * @brief 创建播放器实例
@@ -77,3 +96,15 @@ RTSP_API RtspErrorCode rtsp_player_get_stats(RtspPlayerHandle handle, uint64_t* 
 
 /** @brief 获取错误码对应的静态描述字符串。 */
 RTSP_API const char* rtsp_get_error_string(RtspErrorCode code);
+
+/** @brief 设置最低输出日志级别（默认 RTSP_LOG_INFO），低于该级别的日志被丢弃。 */
+RTSP_API void rtsp_log_set_level(RtspLogLevel level);
+
+/**
+ * @brief 设置日志文件路径（追加写入，UTF-8 编码）；每次调用会先关闭之前打开的文件。
+ * @param path 日志文件路径；传 nullptr 或空串关闭文件输出
+ */
+RTSP_API void rtsp_log_set_file(const char* path);
+
+/** @brief 设置外部日志回调；传 nullptr 关闭回调输出。回调在日志线程同步调用，应尽快返回。 */
+RTSP_API void rtsp_log_set_callback(RtspLogCallback cb);
